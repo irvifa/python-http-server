@@ -1,5 +1,54 @@
 import socket
-from urllib.parse import urlparse
+from urllib.parse import unquote
+
+class HTTPRequest:
+    def __init__(self, method, target, headers, body):
+        self.method = method
+        self.target = target
+        self.headers = headers
+        self.body = body
+
+    @classmethod
+    def from_raw_request(cls, raw_request):
+        lines = raw_request.split('\r\n')
+        request_line = lines[0].split()
+        method = request_line[0]
+        target = request_line[1]
+
+        headers = {}
+        body = ''
+        is_body = False
+
+        for line in lines[1:]:
+            if line == '':
+                is_body = True
+                continue
+
+            if is_body:
+                body += line
+            else:
+                key, value = line.split(': ', 1)
+                headers[key] = value
+
+        return cls(method, target, headers, body)
+
+class HTTPResponse:
+    def __init__(self, status_code, headers, body):
+        self.status_code = status_code
+        self.headers = headers
+        self.body = body
+
+    def to_raw_response(self):
+        response_line = f'HTTP/1.1 {self.status_code} {self.get_reason_phrase()}\r\n'
+        headers = ''.join([f'{key}: {value}\r\n' for key, value in self.headers.items()])
+        return response_line + headers + '\r\n' + self.body
+
+    def get_reason_phrase(self):
+        phrases = {
+            200: 'OK',
+            404: 'Not Found',
+        }
+        return phrases.get(self.status_code, '')
 
 class HTTPServer:
     def __init__(self, host='localhost', port=4221):
@@ -8,9 +57,8 @@ class HTTPServer:
         self.server_socket = socket.create_server((self.host, self.port), reuse_port=True)
         self.routes = {
             '/': self.handle_root,
-            '/echo': self.handle_echo,
         }
-    
+
     def start(self):
         print(f'Server listening on {self.host}:{self.port}')
         while True:
@@ -18,40 +66,39 @@ class HTTPServer:
             self.handle_request(client_socket)
 
     def handle_request(self, client_socket):
-        request = client_socket.recv(1024).decode('utf-8')
-        request_line = request.split('\n')[0]
-        method, path, _ = request_line.split()
-        parsed_path, _ = self.parse_path(path)
+        raw_request = client_socket.recv(1024).decode('utf-8')
+        request = HTTPRequest.from_raw_request(raw_request)
+        target_path = request.target.split('?')[0]
+        handler = self.routes.get(target_path, self.handle_dynamic_route)
+        handler(client_socket, request)
 
-        handler = self.routes.get(parsed_path, self.handle_404)
-        handler(client_socket)
+    def handle_root(self, client_socket, request):
+        headers = {'Content-Type': 'text/plain', 'Content-Length': '2'}
+        self.send_response(client_socket, HTTPResponse(200, headers, 'OK'))
 
-    def parse_path(self, path):
-        parsed_url = urlparse(path)
-        return parsed_url.path, parsed_url.query
+    def handle_echo(self, client_socket, request):
+        echoed_string = request.target.split('/echo/', 1)[-1]
+        echoed_string = unquote(echoed_string)
+        headers = {
+            'Content-Type': 'text/plain',
+            'Content-Length': str(len(echoed_string)),
+        }
+        self.send_response(client_socket, HTTPResponse(200, headers, echoed_string))
 
-    def handle_root(self, client_socket):
-        self.send_response(client_socket, 200, 'text/plain', 'OK')
-
-    def handle_echo(self, client_socket):
-        self.send_response(client_socket, 200, 'text/plain', 'Echo Handler')
+    def handle_dynamic_route(self, client_socket, request):
+        if request.target.startswith('/echo/'):
+            self.handle_echo(client_socket, request)
+        else:
+            self.handle_404(client_socket)
 
     def handle_404(self, client_socket):
-        self.send_response(client_socket, 404, 'text/plain', '404 Not Found')
+        headers = {'Content-Type': 'text/plain', 'Content-Length': '13'}
+        self.send_response(client_socket, HTTPResponse(404, headers, '404 Not Found'))
 
-    def send_response(self, client_socket, status_code, content_type, body):
-        response_line = f'HTTP/1.1 {status_code} {self.get_reason_phrase(status_code)}\r\n'
-        headers = f'Content-Type: {content_type}\r\nContent-Length: {len(body)}\r\n\r\n'
-        response = response_line + headers + body
-        client_socket.sendall(response.encode('utf-8'))
+    def send_response(self, client_socket, response):
+        raw_response = response.to_raw_response()
+        client_socket.sendall(raw_response.encode('utf-8'))
         client_socket.close()
-
-    def get_reason_phrase(self, status_code):
-        phrases = {
-            200: 'OK',
-            404: 'Not Found',
-        }
-        return phrases.get(status_code, '')
 
 def run_server():
     server = HTTPServer()

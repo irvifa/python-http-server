@@ -1,6 +1,8 @@
 import socket
+import os
 from urllib.parse import unquote
 from threading import Thread
+import sys
 
 class HTTPRequest:
     def __init__(self, method, target, headers, body):
@@ -53,14 +55,16 @@ class HTTPResponse:
         return phrases.get(self.status_code, '')
 
 class HTTPServer:
-    def __init__(self, host='localhost', port=4221):
+    def __init__(self, host='localhost', port=4221, directory='/tmp'):
         self.host = host
         self.port = port
+        self.directory = directory
         self.server_socket = socket.create_server((self.host, self.port), reuse_port=True)
         self.routes = {
             '/': self.handle_root,
             '/echo': self.handle_echo,
             '/user-agent': self.handle_user_agent,
+            '/files': self.handle_files,
         }
 
     def start(self):
@@ -98,9 +102,26 @@ class HTTPServer:
         }
         self.send_response(client_socket, HTTPResponse(200, headers, user_agent))
 
+    def handle_files(self, client_socket, request):
+        filename = request.target.split('/files/', 1)[-1]
+        filepath = os.path.join(self.directory, filename)
+        
+        if os.path.exists(filepath):
+            with open(filepath, 'rb') as file:
+                file_content = file.read()
+            headers = {
+                'Content-Type': 'application/octet-stream',
+                'Content-Length': str(len(file_content)),
+            }
+            self.send_response(client_socket, HTTPResponse(200, headers, file_content.decode('utf-8')))
+        else:
+            self.handle_404(client_socket)
+
     def handle_dynamic_route(self, client_socket, request):
         if request.target.startswith('/echo/'):
             self.handle_echo(client_socket, request)
+        elif request.target.startswith('/files/'):
+            self.handle_files(client_socket, request)
         else:
             self.handle_404(client_socket)
 
@@ -113,9 +134,12 @@ class HTTPServer:
         client_socket.sendall(raw_response.encode('utf-8'))
         client_socket.close()
 
-def run_server():
-    server = HTTPServer()
+def run_server(directory):
+    server = HTTPServer(directory=directory)
     server.start()
 
 if __name__ == '__main__':
-    run_server()
+    directory = '/tmp'
+    if len(sys.argv) > 2 and sys.argv[1] == '--directory':
+        directory = sys.argv[2]
+    run_server(directory)

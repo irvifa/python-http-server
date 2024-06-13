@@ -1,6 +1,7 @@
 import socket
 from urllib.parse import unquote
 
+
 class HTTPRequest:
     def __init__(self, method, target, headers, body):
         self.method = method
@@ -27,8 +28,9 @@ class HTTPRequest:
             if is_body:
                 body += line
             else:
-                key, value = line.split(': ', 1)
-                headers[key] = value
+                if ': ' in line:
+                    key, value = line.split(': ', 1)
+                    headers[key.lower()] = value
 
         return cls(method, target, headers, body)
 
@@ -57,6 +59,8 @@ class HTTPServer:
         self.server_socket = socket.create_server((self.host, self.port), reuse_port=True)
         self.routes = {
             '/': self.handle_root,
+            '/echo': self.handle_echo,
+            '/user-agent': self.handle_user_agent,
         }
 
     def start(self):
@@ -84,6 +88,15 @@ class HTTPServer:
             'Content-Length': str(len(echoed_string)),
         }
         self.send_response(client_socket, HTTPResponse(200, headers, echoed_string))
+
+    def handle_user_agent(self, client_socket, request):
+        user_agent = request.headers.get('user-agent', 'No User-Agent found')
+        headers = {
+            'Content-Type': 'text/plain',
+            'Content-Length': str(len(user_agent)),
+        }
+        self.send_response(client_socket, HTTPResponse(200, headers, user_agent))
+
 
     def handle_dynamic_route(self, client_socket, request):
         if request.target.startswith('/echo/'):

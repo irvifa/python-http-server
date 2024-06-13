@@ -1,6 +1,6 @@
 import socket
 from urllib.parse import unquote
-
+from threading import Thread
 
 class HTTPRequest:
     def __init__(self, method, target, headers, body):
@@ -67,7 +67,8 @@ class HTTPServer:
         print(f'Server listening on {self.host}:{self.port}')
         while True:
             client_socket, _ = self.server_socket.accept()
-            self.handle_request(client_socket)
+            client_thread = Thread(target=self.handle_request, args=(client_socket,))
+            client_thread.start()
 
     def handle_request(self, client_socket):
         raw_request = client_socket.recv(1024).decode('utf-8')
@@ -96,7 +97,6 @@ class HTTPServer:
             'Content-Length': str(len(user_agent)),
         }
         self.send_response(client_socket, HTTPResponse(200, headers, user_agent))
-
 
     def handle_dynamic_route(self, client_socket, request):
         if request.target.startswith('/echo/'):

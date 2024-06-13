@@ -3,6 +3,16 @@ import os
 from urllib.parse import unquote
 from threading import Thread
 import sys
+from enum import Enum
+
+
+class HTTPMethod(Enum):
+    GET = 'GET'
+    POST = 'POST'
+    PUT = 'PUT'
+    DELETE = 'DELETE'
+    PATCH = 'PATCH'
+
 
 class HTTPRequest:
     def __init__(self, method, target, headers, body):
@@ -15,7 +25,7 @@ class HTTPRequest:
     def from_raw_request(cls, raw_request):
         lines = raw_request.split('\r\n')
         request_line = lines[0].split()
-        method = request_line[0]
+        method = HTTPMethod[request_line[0]]
         target = request_line[1]
 
         headers = {}
@@ -36,6 +46,7 @@ class HTTPRequest:
 
         return cls(method, target, headers, body)
 
+
 class HTTPResponse:
     def __init__(self, status_code, headers, body):
         self.status_code = status_code
@@ -50,9 +61,12 @@ class HTTPResponse:
     def get_reason_phrase(self):
         phrases = {
             200: 'OK',
+            201: 'Created',
             404: 'Not Found',
+            500: 'Internal Server Error',
         }
         return phrases.get(self.status_code, '')
+
 
 class HTTPServer:
     def __init__(self, host='localhost', port=4221, directory='/tmp'):
@@ -82,7 +96,7 @@ class HTTPServer:
         handler(client_socket, request)
 
     def handle_root(self, client_socket, request):
-        headers = {'Content-Type': 'text/plain', 'Content-Length': '2'}
+        headers = {'Content-Type': 'text/plain', 'Content-Length': len(request.body)}
         self.send_response(client_socket, HTTPResponse(200, headers, 'OK'))
 
     def handle_echo(self, client_socket, request):
@@ -92,7 +106,8 @@ class HTTPServer:
             'Content-Type': 'text/plain',
             'Content-Length': str(len(echoed_string)),
         }
-        self.send_response(client_socket, HTTPResponse(200, headers, echoed_string))
+        request.headers.update(headers)
+        self.send_response(client_socket, HTTPResponse(200, request.headers, echoed_string))
 
     def handle_user_agent(self, client_socket, request):
         user_agent = request.headers.get('user-agent', 'No User-Agent found')
@@ -100,22 +115,33 @@ class HTTPServer:
             'Content-Type': 'text/plain',
             'Content-Length': str(len(user_agent)),
         }
-        self.send_response(client_socket, HTTPResponse(200, headers, user_agent))
+        request.headers.update(headers)
+        self.send_response(client_socket, HTTPResponse(200, request.headers, user_agent))
 
     def handle_files(self, client_socket, request):
         filename = request.target.split('/files/', 1)[-1]
         filepath = os.path.join(self.directory, filename)
-        
-        if os.path.exists(filepath):
-            with open(filepath, 'rb') as file:
-                file_content = file.read()
+
+        if request.method == HTTPMethod.GET:
+            if os.path.exists(filepath):
+                with open(filepath, 'rb') as file:
+                    file_content = file.read()
+                headers = {
+                    'Content-Type': 'application/octet-stream',
+                    'Content-Length': str(len(file_content)),
+                }
+                request.headers.update(headers)
+                self.send_response(client_socket, HTTPResponse(200, request.headers, file_content.decode('utf-8')))
+            else:
+                self.handle_404(client_socket)
+        elif request.method == HTTPMethod.POST:
+            with open(filepath, 'wb') as file:
+                file.write(request.body.encode('utf-8'))
             headers = {
                 'Content-Type': 'application/octet-stream',
-                'Content-Length': str(len(file_content)),
+                'Content-Length': '0',
             }
-            self.send_response(client_socket, HTTPResponse(200, headers, file_content.decode('utf-8')))
-        else:
-            self.handle_404(client_socket)
+            self.send_response(client_socket, HTTPResponse(201, headers, ''))
 
     def handle_dynamic_route(self, client_socket, request):
         if request.target.startswith('/echo/'):
@@ -126,7 +152,7 @@ class HTTPServer:
             self.handle_404(client_socket)
 
     def handle_404(self, client_socket):
-        headers = {'Content-Type': 'text/plain', 'Content-Length': '13'}
+        headers = {'Content-Type': 'text/plain', 'Content-Length': 0}
         self.send_response(client_socket, HTTPResponse(404, headers, '404 Not Found'))
 
     def send_response(self, client_socket, response):
@@ -134,9 +160,11 @@ class HTTPServer:
         client_socket.sendall(raw_response.encode('utf-8'))
         client_socket.close()
 
+
 def run_server(directory):
     server = HTTPServer(directory=directory)
     server.start()
+
 
 if __name__ == '__main__':
     directory = '/tmp'

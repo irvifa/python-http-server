@@ -2,9 +2,11 @@ import socket
 import os
 import gzip
 import sys
+import argparse
 from threading import Thread
 from enum import Enum
 from urllib.parse import unquote
+from io import BytesIO
 
 
 class HTTPMethod(Enum):
@@ -77,7 +79,7 @@ class HTTPResponse:
     def to_raw_response(self):
         response_line = f'HTTP/1.1 {self.status_code} {self.get_reason_phrase()}\r\n'
         headers = ''.join([f'{key}: {value}\r\n' for key, value in self.headers.items()])
-        return response_line + headers + '\r\n' + self.body
+        return response_line.encode('utf-8') + headers.encode('utf-8') + b'\r\n' + self.body
 
     def get_reason_phrase(self):
         phrases = {
@@ -129,7 +131,7 @@ class HTTPServerWithRoutes:
         handler = self.routes.get(target_path, self.handle_dynamic_route)
         response = handler(request)
         raw_response = response.to_raw_response()
-        client_socket.sendall(raw_response.encode('utf-8'))
+        client_socket.sendall(raw_response)
         client_socket.close()
 
     def handle_root(self, request):
@@ -137,7 +139,9 @@ class HTTPServerWithRoutes:
         headers = {'Content-Type': 'text/plain'}
         if ContentEncoding.GZIP in request.encodings:
             headers['Content-Encoding'] = 'gzip'
-            body = gzip.compress(body.encode('utf-8')).decode('latin1')
+            body = self.gzip_compress(body)
+        else:
+            body = body.encode('utf-8')
         headers['Content-Length'] = str(len(body))
         return HTTPResponse(200, headers, body)
 
@@ -149,7 +153,9 @@ class HTTPServerWithRoutes:
         }
         if ContentEncoding.GZIP in request.encodings:
             headers['Content-Encoding'] = 'gzip'
-            echoed_string = gzip.compress(echoed_string.encode('utf-8')).decode('latin1')
+            echoed_string = self.gzip_compress(echoed_string)
+        else:
+            echoed_string = echoed_string.encode('utf-8')
         headers['Content-Length'] = str(len(echoed_string))
         return HTTPResponse(200, headers, echoed_string)
 
@@ -160,7 +166,9 @@ class HTTPServerWithRoutes:
         }
         if ContentEncoding.GZIP in request.encodings:
             headers['Content-Encoding'] = 'gzip'
-            user_agent = gzip.compress(user_agent.encode('utf-8')).decode('latin1')
+            user_agent = self.gzip_compress(user_agent)
+        else:
+            user_agent = user_agent.encode('utf-8')
         headers['Content-Length'] = str(len(user_agent))
         return HTTPResponse(200, headers, user_agent)
 
@@ -177,9 +185,9 @@ class HTTPServerWithRoutes:
                 }
                 if ContentEncoding.GZIP in request.encodings:
                     headers['Content-Encoding'] = 'gzip'
-                    file_content = gzip.compress(file_content).decode('latin1')
+                    file_content = self.gzip_compress(file_content)
                 headers['Content-Length'] = str(len(file_content))
-                return HTTPResponse(200, headers, file_content.decode('utf-8'))
+                return HTTPResponse(200, headers, file_content)
             else:
                 return self.handle_404(request)
         elif request.method == HTTPMethod.POST:
@@ -187,9 +195,9 @@ class HTTPServerWithRoutes:
                 file.write(request.body.encode('utf-8'))
             headers = {
                 'Content-Type': 'application/octet-stream',
-                'Content-Length': 0,
+                'Content-Length': '0',
             }
-            return HTTPResponse(201, headers, '')
+            return HTTPResponse(201, headers, b'')
 
     def handle_dynamic_route(self, request):
         if request.target.startswith('/echo/'):
@@ -204,18 +212,45 @@ class HTTPServerWithRoutes:
         headers = {'Content-Type': 'text/plain'}
         if ContentEncoding.GZIP in request.encodings:
             headers['Content-Encoding'] = 'gzip'
-            body = gzip.compress(body.encode('utf-8')).decode('latin1')
+            body = self.gzip_compress(body)
+        else:
+            body = body.encode('utf-8')
         headers['Content-Length'] = str(len(body))
         return HTTPResponse(404, headers, body)
 
+    def gzip_compress(self, data):
+        out = BytesIO()
+        with gzip.GzipFile(fileobj=out, mode='wb') as f:
+            f.write(data.encode('utf-8') if isinstance(data, str) else data)
+        return out.getvalue()
 
-def run_server(directory):
-    server = HTTPServerWithRoutes('localhost', 4221, directory)
+
+def run_server(config):
+    server = HTTPServerWithRoutes(config.host, config.port, config.directory)
     server.start()
+
+class HTTPServerConfig:
+    port = None
+    host = None
+    directory = None
+
+    def __init__(self, dictionary):
+        self.__dict__.update(dictionary)
 
 
 if __name__ == '__main__':
     directory = '/tmp'
-    if len(sys.argv) > 2 and sys.argv[1] == '--directory':
-        directory = sys.argv[2]
-    run_server(directory)
+    host = "localhost"
+    port = 4221
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--directory", type=str, default=directory)
+    args = parser.parse_args()
+    run_server(
+        HTTPServerConfig(
+            dict(
+                host=host,
+                port=port,
+                directory=args.directory
+            )
+        )
+    )

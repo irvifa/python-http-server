@@ -1,25 +1,36 @@
 import socket
 import os
-from urllib.parse import unquote
-from threading import Thread
+import gzip
 import sys
+from threading import Thread
 from enum import Enum
+from urllib.parse import unquote
 
 
 class HTTPMethod(Enum):
     GET = 'GET'
     POST = 'POST'
     PUT = 'PUT'
-    DELETE = 'DELETE'
-    PATCH = 'PATCH'
+
+
+class ContentEncoding(Enum):
+    NONE = 'none'
+    GZIP = 'gzip'
+
+
+class ContentType(Enum):
+    TEXT_PLAIN = 'text/plain'
+    APPLICATION_OCTET_STREAM = 'application/octet-stream'
+    CUSTOM = 'custom'
 
 
 class HTTPRequest:
-    def __init__(self, method, target, headers, body):
+    def __init__(self, method, target, headers, body, encodings):
         self.method = method
         self.target = target
         self.headers = headers
         self.body = body
+        self.encodings = encodings
 
     @classmethod
     def from_raw_request(cls, raw_request):
@@ -30,6 +41,7 @@ class HTTPRequest:
 
         headers = {}
         body = ''
+        encodings = []
         is_body = False
 
         for line in lines[1:]:
@@ -38,13 +50,22 @@ class HTTPRequest:
                 continue
 
             if is_body:
-                body += line
+                body += line + '\n'
             else:
                 if ': ' in line:
                     key, value = line.split(': ', 1)
                     headers[key.lower()] = value
+                    if key.lower() == 'accept-encoding':
+                        encodings = []
+                        for e in value.split(','):
+                            encoding = e.strip().lower()
+                            if encoding.upper() in ContentEncoding._member_names_:
+                                encodings.append(ContentEncoding[encoding.upper()])
+        return cls(method, target, headers, body.rstrip('\n'), encodings)
 
-        return cls(method, target, headers, body)
+    def set_content_encoding_header(self):
+        if ContentEncoding.GZIP in self.encodings:
+            self.headers['Content-Encoding'] = 'gzip'
 
 
 class HTTPResponse:
@@ -68,12 +89,15 @@ class HTTPResponse:
         return phrases.get(self.status_code, '')
 
 
-class HTTPServer:
-    def __init__(self, host='localhost', port=4221, directory='/tmp'):
+class HTTPServerWithRoutes:
+    def __init__(self, host, port, directory):
         self.host = host
         self.port = port
         self.directory = directory
-        self.server_socket = socket.create_server((self.host, self.port), reuse_port=True)
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind((self.host, self.port))
+        self.server_socket.listen(5)
         self.routes = {
             '/': self.handle_root,
             '/echo': self.handle_echo,
@@ -91,34 +115,56 @@ class HTTPServer:
     def handle_request(self, client_socket):
         raw_request = client_socket.recv(1024).decode('utf-8')
         request = HTTPRequest.from_raw_request(raw_request)
+        
+        # Check if there's a Content-Length header and read the body accordingly
+        if 'content-length' in request.headers:
+            content_length = int(request.headers['content-length'])
+            body = request.body
+            while len(body.encode('utf-8')) < content_length:
+                body += client_socket.recv(1024).decode('utf-8')
+            request.body = body
+
+        request.set_content_encoding_header()  # Set the Content-Encoding header based on encodings
         target_path = request.target.split('?')[0]
         handler = self.routes.get(target_path, self.handle_dynamic_route)
-        handler(client_socket, request)
+        response = handler(request)
+        raw_response = response.to_raw_response()
+        client_socket.sendall(raw_response.encode('utf-8'))
+        client_socket.close()
 
-    def handle_root(self, client_socket, request):
-        headers = {'Content-Type': 'text/plain', 'Content-Length': len(request.body)}
-        self.send_response(client_socket, HTTPResponse(200, headers, 'OK'))
+    def handle_root(self, request):
+        body = 'OK'
+        headers = {'Content-Type': 'text/plain'}
+        if ContentEncoding.GZIP in request.encodings:
+            headers['Content-Encoding'] = 'gzip'
+            body = gzip.compress(body.encode('utf-8')).decode('latin1')
+        headers['Content-Length'] = str(len(body))
+        return HTTPResponse(200, headers, body)
 
-    def handle_echo(self, client_socket, request):
+    def handle_echo(self, request):
         echoed_string = request.target.split('/echo/', 1)[-1]
         echoed_string = unquote(echoed_string)
         headers = {
             'Content-Type': 'text/plain',
-            'Content-Length': str(len(echoed_string)),
         }
-        request.headers.update(headers)
-        self.send_response(client_socket, HTTPResponse(200, request.headers, echoed_string))
+        if ContentEncoding.GZIP in request.encodings:
+            headers['Content-Encoding'] = 'gzip'
+            echoed_string = gzip.compress(echoed_string.encode('utf-8')).decode('latin1')
+        headers['Content-Length'] = str(len(echoed_string))
+        return HTTPResponse(200, headers, echoed_string)
 
-    def handle_user_agent(self, client_socket, request):
+    def handle_user_agent(self, request):
         user_agent = request.headers.get('user-agent', 'No User-Agent found')
         headers = {
             'Content-Type': 'text/plain',
-            'Content-Length': str(len(user_agent)),
         }
-        request.headers.update(headers)
-        self.send_response(client_socket, HTTPResponse(200, request.headers, user_agent))
+        if ContentEncoding.GZIP in request.encodings:
+            headers['Content-Encoding'] = 'gzip'
+            user_agent = gzip.compress(user_agent.encode('utf-8')).decode('latin1')
+        headers['Content-Length'] = str(len(user_agent))
+        return HTTPResponse(200, headers, user_agent)
 
-    def handle_files(self, client_socket, request):
+    def handle_files(self, request):
         filename = request.target.split('/files/', 1)[-1]
         filepath = os.path.join(self.directory, filename)
 
@@ -128,41 +174,43 @@ class HTTPServer:
                     file_content = file.read()
                 headers = {
                     'Content-Type': 'application/octet-stream',
-                    'Content-Length': str(len(file_content)),
                 }
-                request.headers.update(headers)
-                self.send_response(client_socket, HTTPResponse(200, request.headers, file_content.decode('utf-8')))
+                if ContentEncoding.GZIP in request.encodings:
+                    headers['Content-Encoding'] = 'gzip'
+                    file_content = gzip.compress(file_content).decode('latin1')
+                headers['Content-Length'] = str(len(file_content))
+                return HTTPResponse(200, headers, file_content.decode('utf-8'))
             else:
-                self.handle_404(client_socket)
+                return self.handle_404(request)
         elif request.method == HTTPMethod.POST:
             with open(filepath, 'wb') as file:
                 file.write(request.body.encode('utf-8'))
             headers = {
                 'Content-Type': 'application/octet-stream',
-                'Content-Length': '0',
+                'Content-Length': 0,
             }
-            self.send_response(client_socket, HTTPResponse(201, headers, ''))
+            return HTTPResponse(201, headers, '')
 
-    def handle_dynamic_route(self, client_socket, request):
+    def handle_dynamic_route(self, request):
         if request.target.startswith('/echo/'):
-            self.handle_echo(client_socket, request)
+            return self.handle_echo(request)
         elif request.target.startswith('/files/'):
-            self.handle_files(client_socket, request)
+            return self.handle_files(request)
         else:
-            self.handle_404(client_socket)
+            return self.handle_404(request)
 
-    def handle_404(self, client_socket):
-        headers = {'Content-Type': 'text/plain', 'Content-Length': 0}
-        self.send_response(client_socket, HTTPResponse(404, headers, '404 Not Found'))
-
-    def send_response(self, client_socket, response):
-        raw_response = response.to_raw_response()
-        client_socket.sendall(raw_response.encode('utf-8'))
-        client_socket.close()
+    def handle_404(self, request):
+        body = '404 Not Found'
+        headers = {'Content-Type': 'text/plain'}
+        if ContentEncoding.GZIP in request.encodings:
+            headers['Content-Encoding'] = 'gzip'
+            body = gzip.compress(body.encode('utf-8')).decode('latin1')
+        headers['Content-Length'] = str(len(body))
+        return HTTPResponse(404, headers, body)
 
 
 def run_server(directory):
-    server = HTTPServer(directory=directory)
+    server = HTTPServerWithRoutes('localhost', 4221, directory)
     server.start()
 
 
